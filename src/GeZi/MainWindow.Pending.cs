@@ -104,6 +104,31 @@ namespace GeZi
         }
 
         /// <summary>
+        /// 是否还有**别的**「活着的」任务引用同一个本地路径。
+        /// <para>用于两处安全判定：①续传批添加任务前，避免同一路径出现第二条任务；
+        /// ②「删除并移除」删本地文件前，避免把别人正在写的文件一起删掉
+        /// （历史事故：14:48 连删 8 个 K115.partXX.rar，随后位图残留产出全零文件）。</para>
+        /// <para>必须在 UI 线程调用（读 _tasks）。</para>
+        /// </summary>
+        private bool HasOtherLiveTaskForDest(string dest, TaskItem self)
+        {
+            if (string.IsNullOrEmpty(dest)) return false;
+            try
+            {
+                foreach (var other in _tasks)
+                {
+                    if (other == null || ReferenceEquals(other, self) || other.Job == null) continue;
+                    if (!string.Equals(other.Job.Dest, dest, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (other.State == JobState.Downloading || other.State == JobState.Queued
+                        || other.State == JobState.Paused || other.State == JobState.Cancelling)
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
         /// 把当前"未完成"的任务（排队/下载/暂停）写进持久化记录，
         /// 已完成的从记录里移除。供下次启动提示"有 N 个未完成任务"。
         /// 节流：只有"未完成任务的名字 + 状态 + 落盘路径"组合变了才真正写盘 ——
@@ -274,13 +299,32 @@ namespace GeZi
                 //   磁盘记录若落在这些 Dest 上，说明它对应的任务已经结束，不再保留。
                 //   ⚠️ 只排除终态（Completed/Failed/Cancelled）；Cancelling 是非终态
                 //      （强杀时分片可能还没清完），必须继续保留 —— AGENTS.md 二十一节红线。
+                //   ⚠️ Failed 自 2026-11-15 起不是无条件终态：见下面分支的注释。
                 var terminalDests = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                bool keepFailedForResume = false;
                 foreach (var t in _tasks)
                 {
                     if (t?.Job == null || string.IsNullOrEmpty(t.Job.Dest)) continue;
-                    if (t.State == JobState.Completed || t.State == JobState.Failed
-                        || t.State == JobState.Cancelled)
+                    if (t.State == JobState.Completed || t.State == JobState.Cancelled)
                         terminalDests.Add(t.Job.Dest);
+                    else if (t.State == JobState.Failed)
+                    {
+                        // 🚨 2026-11-15：失败 ≠ 没救了。
+                        //   停滞看门狗（DownloadService.CheckStall）把「10 分钟一个字节都不进」
+                        //   报成 Failed，这类任务**续传位图还在、文件也还在**，重新取一次直链
+                        //   就能从断点接着下。若照旧把 Failed 一律当终态，SyncPending 会把它的
+                        //   「未完待续」记录丢掉 → 用户想继续时连入口都没了，只能从网盘重加。
+                        //   判据用位图是否存在：正常收尾成功后 ClearResumeAsync 会删掉它，
+                        //   所以「有 .geziresume」= 还有残活要收，必须保留入口。
+                        if (File.Exists(t.Job.Dest + ".geziresume"))
+                        {
+                            keepFailedForResume = true;
+                        }
+                        else
+                        {
+                            terminalDests.Add(t.Job.Dest);
+                        }
+                    }
                 }
 
                 // ③ 保留磁盘上有、但这一轮没进 _tasks 的记录。
@@ -315,6 +359,10 @@ namespace GeZi
                 //   右上角「未完成」徽章就一直不刷新。
                 if (terminalDests.Count > 0)
                     sig += "#T" + terminalDests.Count;
+                // 有「失败但还能续」的任务时也要让签名发生变化，
+                // 否则徽章/磁盘记录可能因为签名恰好相同而被早退吞掉。
+                if (keepFailedForResume)
+                    sig += "#K";
                 if (sig == _pendingSig)
                     return;
                 _pendingSig = sig;
@@ -1545,6 +1593,9 @@ namespace GeZi
                             Name = p.Name ?? Path.GetFileName(dest),
                             Url = url,
                             Dest = dest,
+                            // 2026-11-15：续传取链同样是「先取好再排队」，同样要记签发时间，
+                            // 否则重启后一批续传里排在后面的任务会拿着过期链开跑。
+                            UrlIssuedUtc = DateTime.UtcNow,
                             // 🚨 续传也必须按「这条任务来自哪家网盘」带全套下载头。
                             //    原来这里一个头都没设 → 下载器全部回落到夸克默认值：
                             //    阿里 OSS 400（签名绑 Referer）、迅雷 403、UC 403（Referer/UA 都要 UC 的）
@@ -1695,23 +1746,48 @@ namespace GeZi
                 }
 
                 LogAllocation(alloc);
-                // 一次性加：续传可能一次恢复几十上百条，逐条加会让分组视图反复重排
-                var resumedRows = new List<TaskItem>(jobs.Count);
-                foreach (var job in jobs)
-                    resumedRows.Add(new TaskItem(job, job.Name));
-
-                // 🚨 2026-11-01：这三步**全是 UI 操作**（改 _tasks 集合、刷日志框、
-                //   启动任务并把状态推给界面）。上面有大量 ConfigureAwait(false)，
-                //   到这里很可能已经在线程池线程上 —— 直接调会抛
-                //   InvalidOperationException（"另一个线程拥有该对象"），
-                //   而且是**静默**抛在 async void / 未观察 Task 里，用户只看到
-                //   「任务加进来了但一直排队、没速度」。必须整体切回主线程。
+                // 🚨 2026-11-15：先在这里把「同路径已经在跑」的任务剔掉，再建行。
+                //    原来无条件 AddTaskRows + RunJobs —— 用户在任务卡住时点「继续下载」，
+                //    同一路径就变成两条任务：两条任务写同一个文件、共用同一份 .geziresume，
+                //    删掉其中一条会把数据文件一起删掉（14:48 事故），残留位图又会
+                //    让下一次续传只补 0.1%、其余全是预分配的全零。
+                //    这一步必须读 _tasks，所以整段放进 UI 线程。
                 RunOnUi(() =>
                 {
-                    AddTaskRows(resumedRows);
-                    Log("已续传 " + jobs.Count + " 个任务。");
-                    RunJobs(jobs);
+                    var keepJobs = new List<DownloadJob>(jobs.Count);
+                    var keepRows = new List<TaskItem>(jobs.Count);
+                    int skippedDup = 0;
+                    foreach (var job in jobs)
+                    {
+                        if (job == null) continue;
+                        if (HasOtherLiveTaskForDest(job.Dest, null))
+                        {
+                            skippedDup++;
+                            continue;
+                        }
+
+                        keepJobs.Add(job);
+                        // 一次性加：续传可能一次恢复几十上百条，逐条加会让分组视图反复重排
+                        keepRows.Add(new TaskItem(job, job.Name));
+                    }
+
+                    if (skippedDup > 0)
+                    {
+                        Log(string.Format(
+                            "已跳过 {0} 个同名任务：该路径已有任务在跑，不会再起第二条", skippedDup));
+                    }
+
+                    if (keepRows.Count == 0)
+                    {
+                        Log("没有需要续传的任务（同名文件已在下载中）。");
+                        return;
+                    }
+
+                    AddTaskRows(keepRows);
+                    Log("已续传 " + keepJobs.Count + " 个任务。");
+                    RunJobs(keepJobs);
                 });
+
             }
             finally
             {

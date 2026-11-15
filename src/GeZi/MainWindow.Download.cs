@@ -1042,6 +1042,9 @@ namespace GeZi
                 jobs.Add(new DownloadJob
                 {
                     Name = item.Name, Url = item.Url, Dest = dest,
+                    // 2026-11-15：记下这张链是什么时候取到的。批量取链 + 低并发排队时，
+                    // 后面的任务开跑前链就过期了 —— 引擎靠这个时间戳在开跑前先换一张。
+                    UrlIssuedUtc = DateTime.UtcNow,
                     // 非夸克网盘用签名直链，不带夸克 Cookie（避免把夸克登录态发给别家 CDN）
                     Cookie = DownloadCookie,
                     Referer = OwnDownloadReferer,
@@ -1714,6 +1717,9 @@ namespace GeZi
                 jobs.Add(new DownloadJob
                 {
                     Name = item.Name, Url = item.Url, Dest = dest,
+                    // 2026-11-15：记下这张链是什么时候取到的。批量取链 + 低并发排队时，
+                    // 后面的任务开跑前链就过期了 —— 引擎靠这个时间戳在开跑前先换一张。
+                    UrlIssuedUtc = DateTime.UtcNow,
                     Cookie = DownloadCookie,
                     Referer = OwnDownloadReferer,
                     UserAgent = OwnDownloadUserAgent,

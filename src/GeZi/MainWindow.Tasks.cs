@@ -706,6 +706,19 @@ namespace GeZi
 
                 string dest = t.Job.Dest;
                 string name = t.Name;
+
+                // 🚨 2026-11-15：同一路径上可能同时存在两条任务（续传批重复添加的）。
+                //    删掉其中一条就会按路径把另一条正在下载的数据文件一起删掉 ——
+                //    14:48 连删 8 个「K115.partXX.rar」正是这么来的，随后残留的位图
+                //    又让续传生成全零文件。还有别的任务在用这个路径时，只移除这一行，
+                //    磁盘文件与续传信息都留给它。
+                if (HasOtherLiveTaskForDest(dest, t))
+                {
+                    Log("该路径还有另一个任务在用，只移除记录、不删本地文件：「" + name + "」");
+                    RemoveTaskRow(t);
+                    continue;
+                }
+
                 // 🚨 2026-11-07：先标记为「已删除」，必须在 SyncPending 之前。
                 //   否则第 ③ 段会把磁盘上那条旧记录捡回来，徽章与 .geziresume 都会复活。
                 MarkPendingDeleted(dest);

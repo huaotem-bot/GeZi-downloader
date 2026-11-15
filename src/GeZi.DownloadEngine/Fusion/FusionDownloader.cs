@@ -142,10 +142,67 @@ namespace GeZi.DownloadEngine
             bool wasCancelled = false;
             var sw = Stopwatch.StartNew();
 
+            // 「开跑前换链」只做一次：重试环里后续的换链由 4xx 判定负责。
+            bool preStartRefreshDone = false;
+
             while (true)
             {
                 Exception failure = null;
                 bool cancelled = false;
+
+                // ── 开跑前先看链龄（2026-11-15）────────────────────────────────
+                // 取链是**批量**的：15 个文件一次性取完再排队，而并发只有 3。
+                // 于是第 13 个任务开跑时，手里那张链已经签发 68 分钟了 —— 早过期。
+                // 症状不是报错，而是下到 99.9% 之后最后几个分片被 CDN 反复拒绝，
+                // 没有 4xx 可判，整个自愈链不触发，任务永久卡住。
+                //
+                // 判据用本地缓存 TTL（LinkLifetime.CacheSeconds = 240s）：
+                // 签发超过这个时间的链，连本地缓存都认为该重取了，开跑前换一张最划算。
+                if (!preStartRefreshDone)
+                {
+                    preStartRefreshDone = true;
+
+                    TimeSpan age = job.UrlIssuedUtc.HasValue
+                        ? DateTime.UtcNow - job.UrlIssuedUtc.Value
+                        : TimeSpan.Zero;
+
+                    if (job.LinkRefresher != null
+                        && job.UrlIssuedUtc.HasValue
+                        && age.TotalSeconds > GeZi.Core.Support.LinkLifetime.CacheSeconds)
+                    {
+                        if (log != null)
+                        {
+                            log(string.Format(
+                                "这张直链已签发 {0} 分钟（排队等待期间已过期），开跑前先重新取一张…",
+                                Math.Round(age.TotalMinutes)));
+                        }
+
+                        try
+                        {
+                            string freshUrl = await job.LinkRefresher(cancel).ConfigureAwait(false);
+                            if (!string.IsNullOrEmpty(freshUrl))
+                            {
+                                currentUrl = freshUrl;
+                                job.Url = freshUrl;
+                                job.UrlIssuedUtc = DateTime.UtcNow;
+                            }
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            wasCancelled = true;
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            // 换链失败不致命：手里这张也许还没真过期，照常下；
+                            // 真过期了，循环里的 401/403 自愈会接手。
+                            if (log != null)
+                            {
+                                log("开跑前换链失败，先用原链继续：" + ex.Message);
+                            }
+                        }
+                    }
+                }
 
                 // 本次尝试活了多久 —— 用来区分「TTL 到期」和「一刷新就挂」。
                 var attemptSw = Stopwatch.StartNew();
@@ -719,6 +776,15 @@ namespace GeZi.DownloadEngine
             PreconditionFailed,
             /// <summary>HTTP 200 但内容不对：服务端返回了错误页，表现为长度与源大小不符。</summary>
             LengthMismatch,
+            /// <summary>
+            /// 「没报错，但一个字节都不进来了」：停滞看门狗判定这条链已经取不动数据。
+            /// <para>
+            /// 🚨 2026-11-15：实测形态是连接被 CDN 静静关掉 / 分片请求被反复拒绝，
+            /// 全程**没有 4xx**，所以 401/403 那一套判据完全认不出来，
+            /// 任务就卡在 99.9% 直到永远。把它归进「值得换链」，才能自动恢复。
+            /// </para>
+            /// </summary>
+            Stalled,
         }
 
         /// <summary>
@@ -754,6 +820,13 @@ namespace GeZi.DownloadEngine
             if (ex is LinkLengthMismatchException)
             {
                 return LinkRefreshReason.LengthMismatch;
+            }
+
+            // 停滞看门狗：同样没有状态码，但现象等价于「这条链已经取不动数据了」。
+            // 换一张链是唯一可能自救的动作，所以必须归到可重新取链那一类。
+            if (ex is LinkStalledException)
+            {
+                return LinkRefreshReason.Stalled;
             }
 
             int code = 0;
@@ -796,6 +869,7 @@ namespace GeZi.DownloadEngine
                 case LinkRefreshReason.Gone: return "HTTP 410 直链已失效";
                 case LinkRefreshReason.PreconditionFailed: return "HTTP 412 前置条件失败";
                 case LinkRefreshReason.LengthMismatch: return "返回内容不是文件（疑似错误页）";
+                case LinkRefreshReason.Stalled: return "长时间没有任何数据（直链疑似已失效）";
                 default: return "非签名类错误";
             }
         }

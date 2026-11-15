@@ -101,6 +101,24 @@ public class DownloadService : AbstractDownloadService
     private CancellationTokenSource _resumeSaveCts;
     private Task _resumeSaveTask;
 
+    // ---- 停滞看门狗（2026-11-15）----
+    // 用户实测（3 GB 分卷，512 路）：直链约 1 小时后失效，最后几个分片的请求被 CDN
+    // 反复以「连接被服务端关闭或强制取消」拒绝。引擎按策略重试，但**重试没有终点**，
+    // 于是任务永久停在 99.9%：不报成功、不报失败、连接也不放，界面看起来像卡死。
+    //
+    // 判据用「产物级」而不是「请求级」：已收到字节数连续 StallAbortMinutes 分钟没增加，
+    // 就主动取消本次下载（走既有的取消路径，续传位图保留），并抛 LinkStalledException
+    // 交给上层 —— FusionDownloader 认得它，会**自动重新取一张直链**再从断点接着下，
+    // 用户看到的是「正在重新取链」而不是任务死掉。换链次数用尽才最终报失败。
+    //
+    // 阈值取 6 分钟：真在下的任务每帧都在涨字节数，慢到 1 KB/s 也会重置计时；
+    // 只有「一个字节都不进」才会命中，不会误杀慢速任务。
+    // 之所以不再取更长：现在恢复是自动的，等得越久只是白等（实测卡死的那次白等了 2 小时）。
+    private const int StallAbortMinutes = 6;
+    private long _stallLastBytes = -1;
+    private DateTime _stallLastAdvanceUtc = DateTime.UtcNow;
+    private bool _stallAbortRequested;
+
     // ---- 慢连接抢占切出来的分片 ----
     // 抢占会「先改原分片 End，再把后半段作为新 Chunk 入队」，但 Package.Chunks 是规划阶段
     // 定下的原始数组，新片不会进数组。若保存续传时只看 Package.Chunks，原片 End 已被改小、
@@ -274,6 +292,12 @@ public class DownloadService : AbstractDownloadService
             // 否则上一轮残留的尾巴字节会让进度条一开始就超过 0%。
             Package.ExtraReceivedBytes = 0;
             Package.Phase = null;
+            // 停滞看门狗的计数必须每次新下载都复位：同一个 DownloadService 实例会被
+            // 反复复用，上一轮的「已停滞」标记若留着，下一次用户手动取消就会被误报成
+            // 「停滞中止」。见 CheckStall 的注释。
+            _stallLastBytes = -1;
+            _stallLastAdvanceUtc = DateTime.UtcNow;
+            _stallAbortRequested = false;
             // 准备阶段全程给可见状态：这几步都是网络往返，没有进度事件，
             // 界面会停在上一帧 —— 用户以为卡死了。400ms 后显示，快的话不闪。
             SchedulePhase("正在获取文件信息…");
@@ -498,6 +522,20 @@ public class DownloadService : AbstractDownloadService
                 // 只停保存器而不落盘 = 取消后完全没有续传信息（实测 24MB / 0.3 秒的下载就命中）。
                 await SaveResumeSnapshotAsync(CancellationToken.None).ConfigureAwait(false);
             }
+            // 🚨 2026-11-15：这次「取消」不是用户点的，是停滞看门狗发起的。
+            //   不报「已取消」（界面会显示成「已暂停」，用户根本看不出发生了什么），
+            //   而是抛 LinkStalledException —— 上层（FusionDownloader）认得它，
+            //   会**自动重新取一张直链**再从断点接着下，用户只看到一行「正在重新取链」。
+            //   只有换链次数真的用完，才会最终作为失败上报。
+            if (_stallAbortRequested)
+            {
+                var stallError = new LinkStalledException(
+                    "连续 " + StallAbortMinutes + " 分钟没有任何字节落盘：最后几个分片的请求被服务端反复拒绝，"
+                    + "直链多半已过期。");
+                _logger?.LogError(stallError, "本次下载因长期无进展被中止，交由上层重新取链。");
+                throw stallError;
+            }
+
             await SendDownloadCompletionSignal(DownloadStatus.Stopped, exp).ConfigureAwait(false);
         }
         catch (Exception exp)
@@ -1067,6 +1105,54 @@ public class DownloadService : AbstractDownloadService
     }
 
     /// <summary>
+    /// 续传位图与本地数据文件是否对得上。
+    /// <para>位图只描述「哪些分片下过」，从不描述「那份数据还在不在」。文件被删掉后
+    /// 残留的位图会被无条件采信，于是只补最后几个分片、其余位置保留预分配的全零 ——
+    /// 这正是「长度对、内容全零、MD5 必错」的来源。</para>
+    /// <para>判据：文件必须存在、长度大于 0，且不短于位图里已标记完成的分片终点。
+    /// 预分配的文件长度 = 总长，正常续传一定满足；只有「文件被删后重建」才会短于它。</para>
+    /// </summary>
+    private bool DataFileMatchesResume(ResumeState state)
+    {
+        try
+        {
+            if (state == null || string.IsNullOrEmpty(_resumeKey) || !File.Exists(_resumeKey))
+            {
+                return false;
+            }
+
+            long length = new FileInfo(_resumeKey).Length;
+            if (length <= 0)
+            {
+                return false;
+            }
+
+            ResumeChunk[] chunks = state.Chunks;
+            if (chunks == null || chunks.Length == 0)
+            {
+                return false;
+            }
+
+            long highestComplete = 0;
+            for (int i = 0; i < chunks.Length; i++)
+            {
+                ResumeChunk chunk = chunks[i];
+                if (chunk != null && chunk.IsComplete && chunk.End > highestComplete)
+                {
+                    highestComplete = chunk.End;
+                }
+            }
+
+            return length >= highestComplete;
+        }
+        catch
+        {
+            // 判不了就当对不上：宁可重下，也不要产出坏文件
+            return false;
+        }
+    }
+
+    /// <summary>
     /// 读续传状态。任何不一致（总长变了、资源标识变了、分片表不连续）都当没有续传并清掉旧状态。
     /// </summary>
     private async Task<ResumeState> LoadResumeAsync(long totalBytes, string validatorValue, CancellationToken cancel)    {
@@ -1092,6 +1178,20 @@ public class DownloadService : AbstractDownloadService
 
         if (state == null)
         {
+            return null;
+        }
+
+        // 🚨 2026-11-15：位图只记「哪些分片下过」，不记「数据还在不在」。
+        //    实测事故链路：同一路径上有两条同名任务（续传批重复添加），
+        //    删掉其中一条时按路径把数据文件删了，位图却留了下来
+        //    （取消分支的 catch 会再写一次 .geziresume）；重启后位图声称 99.9% 完成，
+        //    落盘层新建一个全零文件，只补最后 0.1% → 长度对、内容全零，MD5 必错。
+        //    这里补一道落地核对：目标文件不存在、或短于位图声称的完成位置，
+        //    一律作废位图整份重下 —— 重下的代价是一次传输，留着坏文件的代价是用户白等几小时。
+        if (!DataFileMatchesResume(state))
+        {
+            _logger?.LogWarning("续传位图还在，但本地数据文件已不存在或不完整 → 作废位图，整份重下");
+            await ClearResumeAsync().ConfigureAwait(false);
             return null;
         }
 
@@ -1326,8 +1426,70 @@ public class DownloadService : AbstractDownloadService
                     }
 
                     await SaveResumeSnapshotAsync(token).ConfigureAwait(false);
+
+                    // 借这趟周期性心跳顺带看一眼「是不是一个字节都不进了」。
+                    // 放在快照之后：此时 Package 一定已建好存储，读字节数是有意义的。
+                    CheckStall();
                 }
             });
+    }
+
+    /// <summary>
+    /// 停滞看门狗（2026-11-15）：已收到字节数连续 <c>StallAbortMinutes</c> 分钟
+    /// 没有增加，就判定本次下载已经推不动了，主动取消并留下明确原因。
+    ///
+    /// <para>
+    /// 用 <c>DownloadPackage.ReceivedBytesSize</c> 而不是「文件长度」：
+    /// 共写模式会预分配满尺寸文件，长度从第一秒起就恒等于总长，拿它判进度永远是「满」。
+    /// </para>
+    /// <para>
+    /// 暂停时直接放行：暂停本来就不产字节，若照判会变成「暂停 10 分钟后被自动取消」。
+    /// </para>
+    /// </summary>
+    private void CheckStall()
+    {
+        try
+        {
+            if (IsPaused)
+            {
+                // 恢复后重新起算，不要把暂停的这段时间算进停滞窗口。
+                _stallLastBytes = -1;
+                return;
+            }
+
+            DownloadPackage package = Package;
+            if (package == null || package.Chunks == null || package.Chunks.Length == 0)
+            {
+                return;
+            }
+
+            long done = package.ReceivedBytesSize;
+            if (_stallLastBytes < 0 || done > _stallLastBytes)
+            {
+                _stallLastBytes = done;
+                _stallLastAdvanceUtc = DateTime.UtcNow;
+                return;
+            }
+
+            if ((DateTime.UtcNow - _stallLastAdvanceUtc).TotalMinutes < StallAbortMinutes)
+            {
+                return;
+            }
+
+            _stallAbortRequested = true;
+            _logger?.LogError("停滞中止：" + StallAbortMinutes
+                + " 分钟没有任何字节落盘（已完成 " + done + "/" + package.TotalFileSize
+                + " 字节）。剩下的分片多半已经取不回来 —— 直链过期，或 CDN 持续拒绝这几个区间。"
+                + "本次尝试已停止，进度全部保留，接下来会自动重新取一张直链接着下。");
+
+            // 用取消把在途连接收干净：worker 观察到取消就放手，
+            // 不会留下一堆占着连接却不再产数据的 socket。
+            try { _globalCancellationTokenSource.Cancel(); } catch { }
+        }
+        catch
+        {
+            // 看门狗自己出事绝不能影响下载主流程
+        }
     }
 
     /// <summary>
